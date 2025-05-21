@@ -78,37 +78,6 @@ pub mod collection_prices {
         Ok(())
     }
 
-    pub fn update_payment_mint(
-        ctx: Context<UpdatePaymentMint>,
-        new_payment_mint: Pubkey,
-    ) -> Result<()> {
-        // validates in context owner is modifying
-        let collection = &mut ctx.accounts.collection_prices_data;
-        msg!(
-            "Updating payment mint from {} to {}",
-            collection.payment_mint,
-            new_payment_mint
-        );
-        collection.payment_mint = new_payment_mint;
-        Ok(())
-    }
-
-    pub fn update_prices(
-        ctx: Context<UpdatePrices>,
-        new_prices: Vec<u64>
-    ) -> Result<()> {
-        let collection = &mut ctx.accounts.collection_prices_data;
-    
-        require!(
-            new_prices.len() == collection.prices.len(),
-            CustomError::PriceLengthMismatch
-        );
-    
-        collection.prices = new_prices;
-    
-        Ok(())
-    }
-
     pub fn lamports_purchase(
         ctx: Context<LamportsPurchase>, 
         trait_indexes: Vec<u16>,
@@ -341,42 +310,6 @@ pub struct UpdateCollectionPriceToken<'info> {
     pub owner: Signer<'info>,
 
     /// CHECK: PDA seed
-    pub collection_address: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"prices", collection_address.key().as_ref()],
-        bump = collection_prices_data.bump,
-        has_one = owner @ CustomError::Unauthorized
-    )]
-    pub collection_prices_data: Account<'info, CollectionPricesData>,
-}
-
-// remove this function
-#[derive(Accounts)]
-pub struct UpdatePaymentMint<'info> {
-    #[account(mut)]
-    pub owner: Signer<'info>,
-
-    /// CHECK: PDA seed
-    pub collection_address: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"prices", collection_address.key().as_ref()],
-        bump = collection_prices_data.bump,
-        has_one = owner @ CustomError::Unauthorized
-    )]
-    pub collection_prices_data: Account<'info, CollectionPricesData>,
-}
-
-// remove this function
-#[derive(Accounts)]
-pub struct UpdatePrices<'info> {
-    #[account(mut)]
-    pub owner: Signer<'info>,
-
-    /// CHECK: Used only for PDA derivation
     pub collection_address: UncheckedAccount<'info>,
 
     #[account(
