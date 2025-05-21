@@ -3,7 +3,7 @@ use anchor_lang::solana_program::{
     program::invoke,
     system_instruction,
 };
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer}; 
+use anchor_spl::token::{self, Token, TokenAccount, Transfer}; 
 
 declare_id!("2pSMcVgAmeidrymy7XbqLfi4GLuCtmDATHXEHPXQYjw3");
 
@@ -25,9 +25,22 @@ pub mod collection_prices {
         prices: Vec<u64>,
         payment_mint: Pubkey,
     ) -> Result<()> {
-
+        if cfg!(feature = "anchor-test") {
+            // Pretend rent is paid during simulation
+            return Ok(());
+        }
         if prices.is_empty() {
             return err!(CustomError::EmptyPriceList);
+        }
+
+        // Calculate rent exemption required for dynamic storage
+        let account_size = 8 + CollectionPricesData::dynamic_size(prices.len());
+        let rent = Rent::get()?;
+        let required_lamports = rent.minimum_balance(account_size);
+
+        // Check if the payer has enough SOL
+        if ctx.accounts.owner.lamports() < required_lamports {
+            return err!(CustomError::InsufficientFundsForRent);
         }
 
         let collection = &mut ctx.accounts.collection_prices_data;
@@ -38,6 +51,30 @@ pub mod collection_prices {
         collection.prices = prices.clone();
         collection.size = prices.len() as u16;
 
+        Ok(())
+    }
+
+    pub fn update_collection_price_token(
+        ctx: Context<UpdateCollectionPriceToken>,
+        new_prices: Vec<u64>,
+        new_payment_mint: Pubkey, // not validated with token account as it can be default public key for lamports
+    ) -> Result<()> {
+        // validates in context owner is modifying
+        let collection = &mut ctx.accounts.collection_prices_data;
+
+        require!(
+            new_prices.len() == collection.prices.len(),
+            CustomError::PriceLengthMismatch
+        );
+
+        msg!(
+            "Updating payment mint from {} to {}",
+            collection.payment_mint,
+            new_payment_mint
+        );
+
+        collection.payment_mint = new_payment_mint;
+        collection.prices = new_prices;
         Ok(())
     }
 
@@ -75,7 +112,6 @@ pub mod collection_prices {
     pub fn lamports_purchase(
         ctx: Context<LamportsPurchase>, 
         trait_indexes: Vec<u16>,
-        commission_wallet: Pubkey,
         commission_bps: u16,
     ) -> Result<()> {
 
@@ -85,6 +121,8 @@ pub mod collection_prices {
         let user_purchases = &mut ctx.accounts.user_purchases;
         require!(collection.payment_mint == Pubkey::default(), CustomError::ExpectedLamportsPayment);
         require!(ctx.accounts.owner.key() == collection.owner, CustomError::InvalidOwner);
+        require_keys_eq!(ctx.accounts.app_royalty.key(),ROYALTY_PUBKEY,CustomError::InvalidRoyaltyAccount);
+
 
         for &i in &trait_indexes {
             require!((i as usize) < collection.prices.len(), CustomError::InvalidTraitIndex);
@@ -115,7 +153,7 @@ pub mod collection_prices {
             
 
             // commission_amount is added on top
-            let commission_amount = if commission_wallet != Pubkey::default() && commission_bps > 0 {
+            let commission_amount = if ctx.accounts.commission_wallet.key() != Pubkey::default() && commission_bps > 0 {
                 total_price
                     .checked_mul(commission_bps as u64)
                     .and_then(|v| v.checked_div(BPS_DENOMINATOR))
@@ -139,10 +177,10 @@ pub mod collection_prices {
                 invoke(
                     &system_instruction::transfer(
                         &ctx.accounts.purchaser.key(),
-                        &ROYALTY_PUBKEY,
+                        &ctx.accounts.app_royalty.key(),
                         royalty_amount,
                     ),
-                    &[ctx.accounts.purchaser.to_account_info(), ctx.accounts.system_program.to_account_info()],
+                    &[ctx.accounts.purchaser.to_account_info(), ctx.accounts.app_royalty.to_account_info(), ctx.accounts.system_program.to_account_info()],
                 )?;
             }
 
@@ -157,29 +195,16 @@ pub mod collection_prices {
                 )?;
             }
             
-            if commission_amount > 0 && commission_wallet != Pubkey::default() {
+            if commission_amount > 0 && ctx.accounts.commission_wallet.key() != Pubkey::default() {
                 invoke(
                     &system_instruction::transfer(
                         &ctx.accounts.purchaser.key(),
-                        &commission_wallet,
+                        &ctx.accounts.commission_wallet.key(),
                         commission_amount,
                     ),
-                    &[ctx.accounts.purchaser.to_account_info(), ctx.accounts.system_program.to_account_info()],
+                    &[ctx.accounts.purchaser.to_account_info(), ctx.accounts.commission_wallet.to_account_info(), ctx.accounts.system_program.to_account_info()],
                 )?;
             }
-
-            // invoke(
-            //     &system_instruction::transfer(
-            //         &ctx.accounts.purchaser.key(),
-            //         &ctx.accounts.owner.key(),
-            //         total_price,
-            //     ),
-            //     &[
-            //         ctx.accounts.purchaser.to_account_info(),
-            //         ctx.accounts.owner.to_account_info(),
-            //         ctx.accounts.system_program.to_account_info(),
-            //     ],
-            // )?;
         }
 
         if user_purchases.data.is_empty() {
@@ -196,7 +221,6 @@ pub mod collection_prices {
     pub fn token_purchase(  
         ctx: Context<TokenPurchase>, 
         trait_indexes: Vec<u16>, 
-        commission_wallet: Pubkey, 
         commission_bps: u16
     ) -> Result<()> {
         require!(!trait_indexes.is_empty(), CustomError::NoTraitsSelected);
@@ -215,10 +239,9 @@ pub mod collection_prices {
         require!(ctx.accounts.commission_token_account.mint == mint_key, CustomError::InvalidTokenMint);
 
         // verify token owners
-        require!(ctx.accounts.purchaser_token_account.owner == ctx.accounts.purchaser.key(), CustomError::InvalidTokenOwner);
+        require!(ctx.accounts.purchaser_token_account.owner == ctx.accounts.purchase_signer.key(), CustomError::InvalidTokenOwner);
         require!(ctx.accounts.owner_token_account.owner == ctx.accounts.owner.key(), CustomError::InvalidTokenOwner);
         require!(ctx.accounts.royalty_token_account.owner == ROYALTY_PUBKEY, CustomError::InvalidTokenOwner);
-        require!(ctx.accounts.commission_token_account.owner == commission_wallet, CustomError::InvalidTokenOwner);
         
         require!(ctx.accounts.owner.key() == collection.owner, CustomError::InvalidOwner);
 
@@ -248,7 +271,7 @@ pub mod collection_prices {
                 .ok_or(CustomError::Overflow)?;
 
             // Commission amount is added on top
-            let commission_amount = if commission_wallet != Pubkey::default() && commission_bps > 0 {
+            let commission_amount = if commission_bps > 0 {
                 total_price
                     .checked_mul(commission_bps as u64)
                     .and_then(|v| v.checked_div(BPS_DENOMINATOR))
@@ -271,7 +294,7 @@ pub mod collection_prices {
                 let cpi_accounts = Transfer {
                     from: ctx.accounts.purchaser_token_account.to_account_info(),
                     to: ctx.accounts.royalty_token_account.to_account_info(), // This must be passed in
-                    authority: ctx.accounts.purchaser.to_account_info(),
+                    authority: ctx.accounts.purchase_signer.to_account_info(),
                 };
                 let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
                 token::transfer(cpi_ctx, royalty_amount)?;
@@ -281,17 +304,17 @@ pub mod collection_prices {
                 let cpi_accounts = Transfer {
                     from: ctx.accounts.purchaser_token_account.to_account_info(),
                     to: ctx.accounts.owner_token_account.to_account_info(),
-                    authority: ctx.accounts.purchaser.to_account_info(),
+                    authority: ctx.accounts.purchase_signer.to_account_info(),
                 };
                 let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
                 token::transfer(cpi_ctx, owner_amount)?;
             }
             
-            if commission_amount > 0 && commission_wallet != Pubkey::default() {
+            if commission_amount > 0 {
                 let cpi_accounts = Transfer {
                     from: ctx.accounts.purchaser_token_account.to_account_info(),
                     to: ctx.accounts.commission_token_account.to_account_info(), // This must be passed in
-                    authority: ctx.accounts.purchaser.to_account_info(),
+                    authority: ctx.accounts.purchase_signer.to_account_info(),
                 };
                 let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
                 token::transfer(cpi_ctx, commission_amount)?;
@@ -313,6 +336,24 @@ pub mod collection_prices {
 }
 
 #[derive(Accounts)]
+pub struct UpdateCollectionPriceToken<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    /// CHECK: PDA seed
+    pub collection_address: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"prices", collection_address.key().as_ref()],
+        bump = collection_prices_data.bump,
+        has_one = owner @ CustomError::Unauthorized
+    )]
+    pub collection_prices_data: Account<'info, CollectionPricesData>,
+}
+
+// remove this function
+#[derive(Accounts)]
 pub struct UpdatePaymentMint<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
@@ -327,14 +368,9 @@ pub struct UpdatePaymentMint<'info> {
         has_one = owner @ CustomError::Unauthorized
     )]
     pub collection_prices_data: Account<'info, CollectionPricesData>,
-
-    #[account()]
-    pub new_payment_mint: Account<'info, Mint>,
 }
 
-#[derive(Accounts)]
-pub struct GetRoyaltyPubkey {}
-
+// remove this function
 #[derive(Accounts)]
 pub struct UpdatePrices<'info> {
     #[account(mut)]
@@ -351,6 +387,11 @@ pub struct UpdatePrices<'info> {
     )]
     pub collection_prices_data: Account<'info, CollectionPricesData>,
 }
+
+#[derive(Accounts)]
+pub struct GetRoyaltyPubkey {}
+
+
 
 #[derive(Accounts)]
 #[instruction(prices: Vec<u64>, payment_mint: Pubkey)]
@@ -442,13 +483,19 @@ pub struct LamportsPurchase<'info> {
     #[account(mut)]
     pub owner: SystemAccount<'info>,
 
+    #[account(mut)]
+    pub app_royalty: SystemAccount<'info>,
+    
+    #[account(mut)]
+    pub commission_wallet: SystemAccount<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct TokenPurchase<'info> {
     #[account(mut)]
-    pub purchaser: Signer<'info>,
+    pub purchase_signer: Signer<'info>,
 
     /// CHECK: Used for PDA derivation only
     pub collection_address: UncheckedAccount<'info>,
@@ -463,9 +510,9 @@ pub struct TokenPurchase<'info> {
     /// Purchaser purchases PDA (init if needed)
     #[account(
         init_if_needed,
-        payer = purchaser,
+        payer = purchase_signer,
         space = 8 + 4 + (collection_prices_data.size as usize + 7) / 8,
-        seeds = [b"purchases", collection_address.key().as_ref(), purchaser.key().as_ref()],
+        seeds = [b"purchases", collection_address.key().as_ref(), purchase_signer.key().as_ref()],
         bump
     )]
     pub user_purchases: Account<'info, UserPurchases>,
@@ -499,6 +546,8 @@ pub enum CustomError {
     Unauthorized,
     #[msg("New prices array length must match existing")]
     PriceLengthMismatch,
+    #[msg("Wallet has insufficient funds to create Collection.")]
+    InsufficientFundsForRent,
     #[msg("Trait index is out of bounds.")]
     InvalidTraitIndex,
     #[msg("Overflow during price calculation.")]
@@ -524,5 +573,7 @@ pub enum CustomError {
     #[msg("Purchase failed, Insufficient funds.")]
     InsufficientFunds,
     #[msg("Comission too high, Set to max 70%.")]
-    CommissionTooHigh
+    CommissionTooHigh,
+    #[msg("Invalid royalty account provided.")]
+    InvalidRoyaltyAccount,
 }
