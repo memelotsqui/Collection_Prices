@@ -24,6 +24,8 @@ pub mod collection_prices {
         ctx: Context<InitializeCollection>,
         prices: Vec<u64>,
         payment_mint: Pubkey,
+        purchasable_flags: Vec<bool>,
+        claimable_flags: Vec<bool>,  
     ) -> Result<()> {
         if cfg!(feature = "anchor-test") {
             // Pretend rent is paid during simulation
@@ -33,8 +35,16 @@ pub mod collection_prices {
             return err!(CustomError::EmptyPriceList);
         }
 
+        let count = prices.len();
+        if claimable_flags.len() != count || purchasable_flags.len() != count {
+            return err!(CustomError::InvalidBitmaskLength);
+        }
+
+        let claimable_mask = bools_to_bitmask(&claimable_flags);
+        let purchasables_mask = bools_to_bitmask(&purchasable_flags);
+
         // Calculate rent exemption required for dynamic storage
-        let account_size = 8 + CollectionPricesData::dynamic_size(prices.len());
+        let account_size = 8 + CollectionPricesData::dynamic_size(count);
         let rent = Rent::get()?;
         let required_lamports = rent.minimum_balance(account_size);
 
@@ -50,6 +60,8 @@ pub mod collection_prices {
         collection.payment_mint = payment_mint;
         collection.prices = prices.clone();
         collection.size = prices.len() as u16;
+        collection.claimable = claimable_mask;
+        collection.purchasables = purchasables_mask;
 
         Ok(())
     }
@@ -92,13 +104,17 @@ pub mod collection_prices {
         require!(ctx.accounts.owner.key() == collection.owner, CustomError::InvalidOwner);
         require_keys_eq!(ctx.accounts.app_royalty.key(),ROYALTY_PUBKEY,CustomError::InvalidRoyaltyAccount);
 
-
-        for &i in &trait_indexes {
-            require!((i as usize) < collection.prices.len(), CustomError::InvalidTraitIndex);
-        }
-
         let mut total_price: u64 = 0;
         for &i in &trait_indexes {
+            require!((i as usize) < collection.prices.len(), CustomError::InvalidTraitIndex);
+            require!(
+                collection.purchasables
+                    .get(i as usize)
+                    .copied()
+                    .unwrap_or(0) != 1,
+                CustomError::TraitNotPurchasable
+            );
+
             if !user_purchases.has(i) {
                 total_price = total_price
                     .checked_add(collection.prices[i as usize])
@@ -214,12 +230,17 @@ pub mod collection_prices {
         
         require!(ctx.accounts.owner.key() == collection.owner, CustomError::InvalidOwner);
 
+        let mut total_price: u64 = 0;
+
         for &i in &trait_indexes {
             require!((i as usize) < collection.prices.len(), CustomError::InvalidTraitIndex);
-        }
-
-        let mut total_price: u64 = 0;
-        for &i in &trait_indexes {
+            require!(
+                collection.purchasables
+                    .get(i as usize)
+                    .copied()
+                    .unwrap_or(0) != 1,
+                CustomError::TraitNotPurchasable
+            );
             if !user_purchases.has(i) {
                 total_price = total_price
                     .checked_add(collection.prices[i as usize])
@@ -304,6 +325,16 @@ pub mod collection_prices {
     }
 }
 
+fn bools_to_bitmask(bools: &[bool]) -> Vec<u8> {
+    let mut bitmask = vec![0u8; (bools.len() + 7) / 8];
+    for (i, val) in bools.iter().enumerate() {
+        if *val {
+            bitmask[i / 8] |= 1 << (i % 8);
+        }
+    }
+    bitmask
+}
+
 #[derive(Accounts)]
 pub struct UpdateCollectionPriceToken<'info> {
     #[account(mut)]
@@ -349,6 +380,8 @@ pub struct CollectionPricesData {
     pub size: u16,             
     pub payment_mint: Pubkey,
     pub prices: Vec<u64>,
+    pub claimable: Vec<u8>,     // bitmask: one bit per price
+    pub purchasables: Vec<u8>,  // bitmask: one bit per price
 }
 
 #[account]
@@ -379,11 +412,16 @@ impl UserPurchases {
     }
 }
 
+
 impl CollectionPricesData {
     pub fn dynamic_size(prices_len: usize) -> usize {
+        let bitmask_bytes = (prices_len + 7) / 8;
         // 4 + prices_len * 8 = Vec<u64> (4 bytes vec length + each u64 is 8 bytes)
         // bump, owner, size, payment mint, all prices size, prices values
-        8 + 32 + 2 + 32 + 4 + prices_len * 8
+        // claimable: 4 bytes vec length + N bits as bytes
+         // purchasables
+        8 + 1 + 32 + 2 + 32 + 4 + prices_len * 8 + 4 + bitmask_bytes + 4 + bitmask_bytes  
+
     }
 }
 
@@ -509,4 +547,8 @@ pub enum CustomError {
     CommissionTooHigh,
     #[msg("Invalid royalty account provided.")]
     InvalidRoyaltyAccount,
+    #[msg("Invalid bitmask length.")]
+    InvalidBitmaskLength,
+    #[msg("Trait is not purchasable.")]
+    TraitNotPurchasable,
 }

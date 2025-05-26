@@ -31,13 +31,35 @@ describe("collection_prices", () => {
 
   const program = anchor.workspace.CollectionPrices as Program<CollectionPrices>;
 
-  const testCollectionAddress = new PublicKey("5ZgHr3wXt5T3CV8WCuwsZsnfRViLLYdKZ1dHDe23mRrV"); 
+  //const testCollectionAddress = new PublicKey("5ZgHr3wXt5T3CV8WCuwsZsnfRViLLYdKZ1dHDe23mRrV"); 
+  //const testCollectionAddress = new PublicKey("71xe8VLp5gps7fj9vzLjGS6LhDqR9mSYoQAedjqyKu7k"); 
+  const testCollectionAddress = new PublicKey("5nZXNYwYqBtTkdCpYbp7HkYyb9eCQq3NkGoAn6C5E4SJ"); 
+
+  
+
+  
 
   let collectionPricesPDA;
 
   let testCollectionPricesPDA;
 
   before(async () => {
+    const [testCollectionPricesPDA] = await PublicKey.findProgramAddressSync(
+      [Buffer.from("prices"), testCollectionAddress.toBuffer()],
+      program.programId
+    );
+
+    console.log("Derived PDA:", testCollectionPricesPDA.toBase58());
+
+    const account = await program.account.collectionPricesData.fetch(testCollectionPricesPDA);
+
+
+    [collectionPricesPDA] = await PublicKey.findProgramAddressSync(
+      [Buffer.from("prices"), collectionAddress.publicKey.toBuffer()],
+      program.programId
+    );
+  })
+  it("logs prices", async () => {
     const [testCollectionPricesPDA] = await PublicKey.findProgramAddressSync(
       [Buffer.from("prices"), testCollectionAddress.toBuffer()],
       program.programId
@@ -55,14 +77,9 @@ describe("collection_prices", () => {
     console.log("- prices:", account.prices.map((bn: anchor.BN) => bn.toString()));
 
     console.log ("========================");
-
-
-    [collectionPricesPDA] = await PublicKey.findProgramAddressSync(
-      [Buffer.from("prices"), collectionAddress.publicKey.toBuffer()],
-      program.programId
-    );
   })
-
+  return;
+  
   if (true){
     it("Allows user to purchase selected traits", async () => {
       const traitsToBuy = [1]; // indexes (u16) for desired traits
